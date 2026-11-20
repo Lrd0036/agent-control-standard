@@ -180,4 +180,4 @@ ACS events map to OCSF 1.9.0 event classes. The normative class assignments and 
 - **`unmapped.acs`** carries ACS-specific facts that don't have direct OCSF equivalents in OCSF 1.9.0. On a step event it carries `request_id`, `session_id`, and facts from the request that have no OCSF attribute of their own. On a decision event it carries the fields that `join_fields` and `acs_fields` in `ocsf-mapping.json` list. Backends that index `unmapped` keep this fully searchable.
 - **Provenance** flows onto OCSF events under `unmapped.acs.provenance`. Trust classification is omitted on the wire for v0.1; backends that compute trust apply it as an enrichment step.
 
-For more worked examples — including A2A and MCP wrapped events — see [Implementation examples](./OCSF/implementation_examples.md).
+Emit a tool result and its Guardian allow, then count tool results in Splunk or Elasticsearch with the [runnable OCSF example](./OCSF/implementation_examples.md).

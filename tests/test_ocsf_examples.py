@@ -1,4 +1,4 @@
-"""Keep the walkthrough's process example aligned with its stated scenario.
+"""Keep the OCSF walkthrough, runnable producer, and SIEM queries in agreement.
 
 The OCSF tab previously used an invented class, a seconds timestamp, and the
 agent's identity as an identity provider. MkDocs and the link guards accepted
@@ -13,9 +13,14 @@ check before publication.
 
 import json
 import re
+import shlex
+import subprocess
+import sys
 from copy import deepcopy
 from datetime import datetime
+from html import unescape
 from pathlib import Path
+from runpy import run_path
 
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
@@ -24,6 +29,7 @@ from referencing.jsonschema import DRAFT202012
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = ROOT / "specification" / "v0.1.0"
+PRODUCER = Path("assets/examples/ocsf_tool_result.py")
 
 
 def walkthrough_tab():
@@ -35,6 +41,39 @@ def walkthrough_event():
     blocks = re.findall(r"```json\n(.*?)```", walkthrough_tab(), re.DOTALL)
     assert len(blocks) == 1, "The OCSF tab must contain one complete event example"
     return json.loads(blocks[0])
+
+
+@pytest.fixture(scope="module")
+def published_blocks(built_docs):
+    page = built_docs / "spec/trace/OCSF/implementation_examples/index.html"
+    # The highlighter wraps code in spans and escapes literal markup.
+    blocks = re.findall(r"<pre\b[^>]*>(.*?)</pre>", page.read_text(encoding="utf-8"), re.DOTALL)
+    return [unescape(re.sub(r"<[^>]+>", "", block)) for block in blocks]
+
+
+@pytest.fixture(scope="module")
+def produced_events(built_docs, published_blocks, tmp_path_factory):
+    source = ROOT / "docs" / PRODUCER
+    assert (built_docs / PRODUCER).read_bytes() == source.read_bytes()
+    assert source.read_text(encoding="utf-8") in published_blocks
+    run = subprocess.run(
+        [sys.executable, "-I", "-S", source],
+        cwd=tmp_path_factory.mktemp("ocsf"),
+        capture_output=True, text=True, check=True, timeout=10,
+    )
+    step, decision = (json.loads(line) for line in run.stdout.splitlines())
+    return step, decision
+
+
+@pytest.fixture(scope="module", params=["walkthrough", "producer"])
+def step_event(request, produced_events):
+    return walkthrough_event() if request.param == "walkthrough" else produced_events[0]
+
+
+def field_at(event, path):
+    for name in path.split("."):
+        event = event[name]
+    return event
 
 
 def declared_objects_only(schema):
@@ -83,8 +122,8 @@ def validate_copied_acs_fields(acs):
     assert acs["request_id"] != acs["request_id_ref"]
 
 
-def test_walkthrough_uses_the_mapped_process_class():
-    event = walkthrough_event()
+def test_step_uses_the_mapped_process_class(step_event):
+    event = step_event
     method = event["unmapped"]["acs"].get("method")
     assert method == "steps/toolCallResult"
     mapping = json.loads(
@@ -104,8 +143,8 @@ def test_walkthrough_uses_the_mapped_process_class():
     assert "ocsf" not in event["metadata"]
 
 
-def test_walkthrough_represents_a_reflexive_process_exit():
-    event = walkthrough_event()
+def test_step_represents_a_reflexive_process_exit(step_event):
+    event = step_event
     assert "process" in event["actor"], "The actor must identify the exiting process"
     assert "device" in event, "Process Activity requires the actual host device"
     assert "process" in event, "The tool's subprocess must be identified"
@@ -128,20 +167,20 @@ def test_walkthrough_represents_a_reflexive_process_exit():
     assert "asop" not in event["unmapped"]
 
 
-def test_walkthrough_copies_declared_acs_fields():
-    validate_copied_acs_fields(walkthrough_event()["unmapped"]["acs"])
+def test_step_copies_declared_acs_fields(step_event):
+    validate_copied_acs_fields(step_event["unmapped"]["acs"])
 
 
 def check_correlation_uid(event):
-    """Every OCSF step event sets metadata.correlation_uid to its own pair (step_to_class in the mapping)."""
+    """The step and decision both identify the gated request within its session."""
     acs = event["unmapped"]["acs"]
     assert event["metadata"].get("correlation_uid") == f"{acs['session_id']}:{acs['request_id']}", (
         "metadata.correlation_uid must be the step's <session_id>:<request_id>"
     )
 
 
-def test_walkthrough_sets_the_step_correlation_uid():
-    check_correlation_uid(walkthrough_event())
+def test_step_sets_its_correlation_uid(step_event):
+    check_correlation_uid(step_event)
 
 
 @pytest.mark.parametrize("make", [
@@ -180,8 +219,8 @@ def test_copied_acs_fields_reject_old_aliases_and_non_uuid_ids(path, value):
         validate_copied_acs_fields(acs)
 
 
-def test_walkthrough_timestamps_match_the_documented_exit():
-    event = walkthrough_event()
+def test_step_timestamps_match_the_documented_exit(step_event):
+    event = step_event
     timestamp = re.search(r"at `([^`]+Z)`", walkthrough_tab())
     assert timestamp, "The scenario must state its occurrence time in UTC"
     exited_at = datetime.fromisoformat(timestamp[1])
@@ -189,3 +228,79 @@ def test_walkthrough_timestamps_match_the_documented_exit():
     assert event["time"] == expected_ms, "OCSF occurrence time uses milliseconds"
     assert event["process"]["terminated_time"] == expected_ms
     assert event["actor"]["process"]["terminated_time"] == expected_ms
+
+
+def test_producer_joins_the_guardian_allow_to_the_result(produced_events):
+    step, decision = produced_events
+    mapping = json.loads((SPEC / "trace" / "ocsf-mapping.json").read_text(encoding="utf-8"))["properties"]
+    decision_rules = mapping["decision_class"]["properties"]
+    allow = decision_rules["allow_class"]["properties"]
+    for path in allow["required_fields"]["default"]:
+        assert field_at(decision, path) is not None, path
+    assert decision["class_uid"] == allow["class_uid"]["const"]
+    assert decision["class_name"] == allow["class_name"]["const"]
+    assert (decision["category_uid"], decision["category_name"]) == (6, "Application Activity")
+    assert (decision["activity_id"], decision["activity_name"]) == (99, "Allow tool result")
+    assert decision["type_uid"] == decision["class_uid"] * 100 + decision["activity_id"]
+    assert decision["application"]["name"]
+    assert decision["metadata"]["version"] == "1.9.0"
+    assert decision["metadata"]["product"]["name"]
+    assert decision["time"] == step["time"] + 25
+
+    acs = decision["unmapped"]["acs"]
+    assert acs["decision"] == "allow"
+    assert decision["severity_id"] == mapping["severity_mapping"]["default"][acs["decision"]]
+    for name in decision_rules["join_fields"]["default"]:
+        assert acs[name] == step["unmapped"]["acs"][name]
+    check_correlation_uid(decision)
+    assert decision["metadata"]["correlation_uid"] == step["metadata"]["correlation_uid"]
+
+    response_fields = set(acs) - {"session_id"}
+    assert response_fields <= set(decision_rules["acs_fields"]["default"])
+    assert acs["metadata"]["evaluator"] == "deterministic"
+    assert acs["chain_hash"]
+    response_schema = json.loads((SPEC / "response-envelope.json").read_text(encoding="utf-8"))
+    properties = response_schema["$defs"]["AcsResult"]["properties"]
+    for name in response_fields:
+        Draft202012Validator(properties[name], format_checker=FormatChecker()).validate(acs[name])
+
+
+@pytest.mark.parametrize(("verdict", "id_field"), [("deny", "request_id"), ("allow", "request_id_ref")])
+def test_allow_builder_rejects_a_deny_or_another_request(produced_events, verdict, id_field):
+    acs = produced_events[0]["unmapped"]["acs"]
+    params = {"request_id": acs["request_id"], "metadata": {"session_id": acs["session_id"]}}
+    result = {"request_id": acs[id_field], "decision": verdict}
+    allow_event = run_path(str(ROOT / "docs" / PRODUCER))["allow_event"]
+    with pytest.raises(ValueError, match="allow for this tool result"):
+        allow_event(
+            params, result, application={"name": "Example agent runtime"},
+            decided_at="2026-10-09T12:00:00.025Z",
+        )
+
+
+def test_queries_filter_and_group_on_produced_fields(produced_events, published_blocks):
+    step, decision = produced_events
+    [spl] = [block for block in published_blocks if block.startswith("index=")]
+    base, extract, search, stats = spl.splitlines()
+    assert {term.split("=", 1)[0] for term in shlex.split(base)} == {"index", "sourcetype"}
+    assert extract == "| spath"
+    assert search.startswith("| search ") and stats.startswith("| stats count BY ")
+    filters = dict(term.split("=", 1) for term in shlex.split(search.removeprefix("| search ")))
+    groups = stats.removeprefix("| stats count BY ").split()
+    assert filters == {"class_uid": str(step["class_uid"]), "unmapped.acs.method": "steps/toolCallResult"}
+    assert all(str(field_at(step, path)) == value for path, value in filters.items())
+    assert str(decision["class_uid"]) != filters["class_uid"]
+    assert [field_at(step, path) for path in groups] == ["agent_456", "run_command"]
+
+    [elastic] = [json.loads(block) for block in published_blocks if block.startswith("{")]
+    # Elasticsearch applies the same filters and groups using its keyword subfields.
+    assert elastic == {
+        "size": 0,
+        "query": {"bool": {"filter": [
+            {"term": {"class_uid": step["class_uid"]}},
+            {"term": {"unmapped.acs.method.keyword": filters["unmapped.acs.method"]}},
+        ]}},
+        "aggs": {"by_agent_and_tool": {"multi_terms": {
+            "terms": [{"field": f"{path}.keyword"} for path in groups],
+        }}},
+    }
